@@ -1,0 +1,20 @@
+# syntax=docker/dockerfile:1.7
+#
+# Dockerfile used by GoReleaser. The build context contains only this file
+# and the prebuilt `rdw-mcp` binary produced by the `builds` stage, so no
+# Go toolchain or source code is required here.
+
+FROM gcr.io/distroless/static-debian12:nonroot
+
+LABEL org.opencontainers.image.title="rdw-mcp" \
+      org.opencontainers.image.description="MCP server for Dutch RDW vehicle registration data" \
+      org.opencontainers.image.source="https://github.com/rantuma/rdw-mcp" \
+      org.opencontainers.image.licenses="MIT"
+
+COPY rdw-mcp /usr/local/bin/rdw-mcp
+
+USER nonroot:nonroot
+EXPOSE 3000
+
+ENTRYPOINT ["/usr/local/bin/rdw-mcp"]
+CMD ["--http", "--port=3000"]

@@ -1,0 +1,31 @@
+repos:
+  - repo: https://github.com/golangci/golangci-lint
+    rev: v2.11.4
+    hooks:
+      - id: golangci-lint
+        args: [--timeout=5m]
+  - repo: local
+    hooks:
+      - id: go-fmt
+        name: go-fmt
+        entry: gofmt -l -w
+        language: system
+        types: [go]
+      - id: go-vet
+        name: go-vet
+        entry: go vet ./...
+        language: system
+        types: [go]
+        pass_filenames: false
+      - id: go-mod-tidy
+        name: go-mod-tidy
+        entry: go mod tidy
+        language: system
+        files: '(\.go|go\.mod|go\.sum)$'
+        pass_filenames: false
+      - id: gofumpt
+        name: gofumpt
+        entry: gofumpt -l -w .
+        language: system
+        types: [go]
+        pass_filenames: false
