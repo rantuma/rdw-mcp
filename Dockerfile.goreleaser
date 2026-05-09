@@ -14,7 +14,10 @@ LABEL org.opencontainers.image.title="rdw-mcp" \
 COPY rdw-mcp /usr/local/bin/rdw-mcp
 
 USER nonroot:nonroot
+# EXPOSE documents the default port; the actual bind port is taken from
+# RDW_MCP_PORT or PORT (set by Railway, Heroku, Fly, Cloud Run, etc.) and
+# falls back to 3000 when neither is set.
 EXPOSE 3000
 
 ENTRYPOINT ["/usr/local/bin/rdw-mcp"]
-CMD ["--http", "--port=3000"]
+CMD ["--http"]

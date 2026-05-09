@@ -25,7 +25,9 @@ type (
 
 func loadEnvConfig() envConfig {
 	return envConfig{
-		Port:           getEnvInt("RDW_MCP_PORT", defaultPort),
+		// Port precedence: RDW_MCP_PORT (project-specific) > PORT (platform
+		// convention used by Railway, Heroku, Fly, Cloud Run, etc.) > default.
+		Port:           getEnvIntFromKeys(defaultPort, "RDW_MCP_PORT", "PORT"),
 		LogLevel:       parseLogLevel(os.Getenv("RDW_MCP_LOG_LEVEL")),
 		AllowedOrigins: getEnvStringSlice("RDW_MCP_CORS_ORIGINS", []string{"*"}),
 		HTTPTimeout:    getEnvDuration("RDW_MCP_HTTP_TIMEOUT", defaultHTTPTimeout),
@@ -44,6 +46,24 @@ func getEnvInt(key string, def int) int {
 	}
 
 	return n
+}
+
+// getEnvIntFromKeys returns the first parseable integer found by iterating
+// keys in order. If a key is set but cannot be parsed, the next key is tried.
+// Falls back to def when no key yields a valid integer.
+func getEnvIntFromKeys(def int, keys ...string) int {
+	for _, key := range keys {
+		v := os.Getenv(key)
+		if v == "" {
+			continue
+		}
+
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+
+	return def
 }
 
 func getEnvDuration(key string, def time.Duration) time.Duration {
