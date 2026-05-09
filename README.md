@@ -113,12 +113,6 @@ When running with `--http`, the server exposes:
 - `POST /mcp` — Streamable HTTP MCP endpoint
 - `GET  /health` — Health check (JSON status, server name, version)
 
-Hosted endpoint is also available at:
-
-- `https://rdw-mcp-production.up.railway.app/mcp`
-
-CORS is permissive (`*`) by default to ease local development.
-
 ## Development
 
 ```sh
