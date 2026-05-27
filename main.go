@@ -19,9 +19,13 @@ import (
 	"syscall"
 	"time"
 
+	"go.opentelemetry.io/contrib/bridges/otelslog"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/rantuma/rdw-mcp/internal/rdw"
+	"github.com/rantuma/rdw-mcp/internal/telemetry"
 	"github.com/rantuma/rdw-mcp/internal/transport"
 )
 
@@ -47,7 +51,10 @@ func newHTTPClient(timeout time.Duration) *http.Client {
 		timeout = rdw.HTTPTimeout
 	}
 
-	return &http.Client{Timeout: timeout}
+	return &http.Client{
+		Timeout:   timeout,
+		Transport: otelhttp.NewTransport(http.DefaultTransport),
+	}
 }
 
 func newMCPServer(client *http.Client) *mcp.Server {
@@ -55,6 +62,7 @@ func newMCPServer(client *http.Client) *mcp.Server {
 		&mcp.Implementation{Name: serverName, Version: serverVersion()},
 		nil,
 	)
+	srv.AddReceivingMiddleware(instrumentMiddleware)
 	registerAll(srv, client)
 
 	return srv
@@ -70,10 +78,10 @@ func startStdio(ctx context.Context, log *slog.Logger, client *http.Client) erro
 
 func startHTTP(ctx context.Context, log *slog.Logger, client *http.Client, env envConfig) error {
 	mcpSrv := newMCPServer(client)
-	mcpHandler := mcp.NewStreamableHTTPHandler(
+	mcpHandler := otelhttp.NewHandler(mcp.NewStreamableHTTPHandler(
 		func(*http.Request) *mcp.Server { return mcpSrv },
 		nil,
-	)
+	), "mcp")
 
 	ready := newReadinessChecker(client)
 
@@ -173,6 +181,7 @@ func main() {
 	env.Port = *port
 
 	rdw.SetUserAgent(fmt.Sprintf("RDW-MCP-Server/%s", version))
+	rdw.SetInstrumentationVersion(version)
 	// Enable retries + response cache in production. Tests override via TestMain.
 	rdw.SetClientConfig(rdw.ClientConfig{
 		MaxAttempts:    rdw.DefaultMaxAttempts,
@@ -183,14 +192,44 @@ func main() {
 		CacheSize:      rdw.DefaultCacheSize,
 	})
 
-	log := slog.New(slog.NewTextHandler(
+	stderrHandler := telemetry.NewLogHandler(slog.NewTextHandler(
 		os.Stderr,
 		&slog.HandlerOptions{Level: env.LogLevel},
 	))
+	slog.SetDefault(slog.New(stderrHandler))
 	client := newHTTPClient(env.HTTPTimeout)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
+
+	shutdownTelemetry, telErr := telemetry.Setup(
+		ctx,
+		serverName,
+		serverVersion(),
+		callDurationView,
+		rdw.RequestDurationView(),
+	)
+
+	handler := stderrHandler
+	if telemetry.LogsEnabled() {
+		handler = telemetry.NewFanoutHandler(stderrHandler, otelslog.NewHandler(serverName))
+	}
+	log := slog.New(handler)
+	slog.SetDefault(log)
+
+	if telErr != nil {
+		log.WarnContext(ctx, "telemetry setup failed; continuing without it",
+			slog.Any("err", telErr))
+	} else if telemetry.Enabled() {
+		log.InfoContext(ctx, "telemetry enabled")
+		defer func() {
+			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownPeriod)
+			defer shutdownCancel()
+			if err := shutdownTelemetry(shutdownCtx); err != nil {
+				log.WarnContext(ctx, "telemetry shutdown failed", slog.Any("err", err))
+			}
+		}()
+	}
 
 	var err error
 	if *httpMode {

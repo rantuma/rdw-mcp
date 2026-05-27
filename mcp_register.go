@@ -31,6 +31,30 @@ const (
 	promptNameSummarize = "summarize_vehicle"
 )
 
+// registeredToolNames is the closed set of tool names this server exposes. It is
+// the source of truth for telemetry: only these names may appear in the
+// mcp.tool metric label, so a client cannot mint unbounded time series by
+// calling tools/call with arbitrary names. Keep in sync with registerAll.
+//
+//nolint:gochecknoglobals // immutable lookup table for the fixed tool set
+var registeredToolNames = map[string]struct{}{
+	toolNameFull:          {},
+	toolNameLegacy:        {},
+	toolNameBasic:         {},
+	toolNameTechnical:     {},
+	toolNameFuelEmissions: {},
+	toolNameRecalls:       {},
+	toolNameAPKHistory:    {},
+	toolNameDefects:       {},
+}
+
+// isRegisteredTool reports whether name is one of the tools this server exposes.
+func isRegisteredTool(name string) bool {
+	_, ok := registeredToolNames[name]
+
+	return ok
+}
+
 // Tool descriptions.
 const (
 	descFull = "Look up ALL available Dutch vehicle information from RDW datasets " +

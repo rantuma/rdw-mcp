@@ -13,6 +13,11 @@ import (
 	"net/url"
 	"sync"
 	"time"
+
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // RDW API endpoint identifiers and HTTP client configuration.
@@ -428,7 +433,7 @@ func lookupRecallDescription(
 	query.Set("referentiecode_rdw", referentiecode)
 	parsed.RawQuery = query.Encode()
 
-	rows, err := doRDWGet[recallDescription](ctx, client, parsed.String())
+	rows, err := doRDWGet[recallDescription](ctx, client, endpointRecallDesc, parsed.String())
 	if err != nil {
 		return nil, err
 	}
@@ -492,23 +497,101 @@ func makeRDWRequest[T any](
 	query.Set("kenteken", kenteken)
 	parsed.RawQuery = query.Encode()
 
-	return doRDWGet[T](ctx, client, parsed.String())
+	return doRDWGet[T](ctx, client, endpoint, parsed.String())
 }
 
 // doRDWGet performs a GET request against the given fully-qualified Socrata URL
 // and decodes the JSON response into a slice of T. It transparently applies
 // the active per-call timeout, exponential-backoff retry on transient errors,
 // and an in-memory TTL LRU cache keyed by the full URL.
-func doRDWGet[T any](ctx context.Context, client *http.Client, fullURL string) ([]T, error) {
+//
+// dataset is the RDW dataset identifier; it drives the rdw.endpoint telemetry
+// label and is collapsed via endpointName so cardinality stays bounded.
+//
+//nolint:nonamedreturns // intentional: the deferred recorder reads result/err after the body returns
+func doRDWGet[T any](
+	ctx context.Context,
+	client *http.Client,
+	dataset, fullURL string,
+) (result []T, err error) {
 	cfg := getConfig()
 	cache := getCache()
 
+	tracer, reqDuration, retryHist, cacheOps := instruments()
+	label := endpointName(dataset)
+
+	ctx, span := tracer.Start(ctx, "rdw "+label, trace.WithAttributes(
+		attribute.String("rdw.endpoint", label),
+	))
+	defer span.End()
+
+	start := time.Now()
+	attempts := 0
+	cacheHit := false
+
+	// Deferred recorder per logical call. A panic still observes a sample
+	// tagged "internal" so the rdw.* signals stay reliable. The dedicated
+	// defer span.End() above runs after this and survives the re-panic.
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			panicErr := fmt.Errorf("panic: %v", recovered)
+			span.RecordError(panicErr,
+				trace.WithAttributes(attribute.String("error.type", "internal")))
+			span.SetAttributes(attribute.String("error.type", "internal"))
+			span.SetStatus(codes.Error, "panic")
+			err = panicErr
+
+			span.SetAttributes(
+				attribute.Bool("rdw.cache.hit", cacheHit),
+				attribute.Int("rdw.attempts", attempts),
+			)
+			recordRDWCall(ctx, reqDuration, retryHist, label, err, attempts, time.Since(start))
+
+			panic(recovered)
+		}
+
+		span.SetAttributes(
+			attribute.Bool("rdw.cache.hit", cacheHit),
+			attribute.Int("rdw.attempts", attempts),
+		)
+		recordRDWCall(ctx, reqDuration, retryHist, label, err, attempts, time.Since(start))
+	}()
+
 	if cache != nil {
 		if raw, ok := cache.get(fullURL); ok {
-			return decodeRDWBody[T](raw)
+			cacheHit = true
+			recordCacheLookup(ctx, cacheOps, label, true)
+			result, err = decodeRDWBody[T](raw)
+			return result, err
 		}
+		recordCacheLookup(ctx, cacheOps, label, false)
 	}
 
+	body, runErr := runRetryLoop(ctx, client, span, cfg, fullURL, &attempts)
+	if runErr != nil {
+		err = runErr
+		return nil, runErr
+	}
+
+	if cache != nil {
+		cache.set(fullURL, body, cfg.CacheTTL)
+	}
+
+	result, err = decodeRDWBody[T](body)
+	return result, err
+}
+
+// runRetryLoop drives the per-attempt retry/backoff sequence and returns the
+// successful body or the terminating error. It writes attempt count into the
+// caller's counter so the deferred recorder in doRDWGet sees the final value.
+func runRetryLoop(
+	ctx context.Context,
+	client *http.Client,
+	span trace.Span,
+	cfg ClientConfig,
+	fullURL string,
+	attempts *int,
+) ([]byte, error) {
 	callCtx, cancel := context.WithTimeout(ctx, cfg.PerCallTimeout)
 	defer cancel()
 
@@ -518,30 +601,66 @@ func doRDWGet[T any](ctx context.Context, client *http.Client, fullURL string) (
 	)
 
 	for attempt := range cfg.MaxAttempts {
+		*attempts = attempt + 1
 		body, lastErr = singleRDWGet(callCtx, client, fullURL)
 		if lastErr == nil {
-			break
+			return body, nil
 		}
 
+		// A bounded "retry" event per attempt lets traces show retry pacing
+		// without spawning a span per attempt (otelhttp already covers those).
+		span.AddEvent("rdw.retry", trace.WithAttributes(
+			attribute.Int("attempt", *attempts),
+			attribute.String("error.type", classifyRDWError(lastErr)),
+		))
+
 		if !errors.Is(lastErr, errRetryable) || attempt == cfg.MaxAttempts-1 {
+			span.RecordError(lastErr,
+				trace.WithAttributes(attribute.String("error.type", classifyRDWError(lastErr))))
+			span.SetStatus(codes.Error, lastErr.Error())
 			return nil, lastErr
 		}
 
 		backoff := computeBackoff(attempt, cfg.BaseBackoff, cfg.MaxBackoff)
 		if sleepErr := sleepCtx(callCtx, backoff); sleepErr != nil {
+			span.RecordError(sleepErr,
+				trace.WithAttributes(attribute.String("error.type", classifyRDWError(sleepErr))))
+			span.SetStatus(codes.Error, sleepErr.Error())
 			return nil, sleepErr
 		}
 	}
 
-	if lastErr != nil {
-		return nil, lastErr
-	}
+	return body, lastErr
+}
 
-	if cache != nil {
-		cache.set(fullURL, body, cfg.CacheTTL)
+// recordRDWCall observes the duration histogram and the retry-attempts histogram
+// for one logical doRDWGet call. errType is "" on success, in which case the
+// label is omitted (low-cardinality contract).
+func recordRDWCall(
+	ctx context.Context,
+	reqDuration metric.Float64Histogram,
+	retryHist metric.Int64Histogram,
+	endpoint string,
+	err error,
+	attempts int,
+	elapsed time.Duration,
+) {
+	durAttrs := []attribute.KeyValue{
+		attribute.String("rdw.endpoint", endpoint),
+		attribute.String("rdw.status", callStatus(err)),
 	}
+	if errType := classifyRDWError(err); errType != "" {
+		durAttrs = append(durAttrs, attribute.String("error.type", errType))
+	}
+	reqDuration.Record(ctx, elapsed.Seconds(), metric.WithAttributes(durAttrs...))
 
-	return decodeRDWBody[T](body)
+	// attempts can be 0 only when the cache hit short-circuited before the
+	// retry loop ran — don't record a "0 attempts" sample in that case.
+	if attempts > 0 {
+		retryHist.Record(ctx, int64(attempts), metric.WithAttributes(
+			attribute.String("rdw.endpoint", endpoint),
+		))
+	}
 }
 
 // singleRDWGet performs one GET request and returns the raw response body.
